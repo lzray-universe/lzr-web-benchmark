@@ -306,21 +306,116 @@ async function runCpuMulti(totalMs = 15_000, windowMs = 10_000) {
 }
 
 // ---------- GPU Benchmark ----------
+async function runGpuWebGLFallback(totalMs, windowMs, apiEl, scoreEl, metaEl) {
+  // WebGL fallback: heavy fragment loop
+  const canvas = document.getElementById('glcanvas');
+  const gl = canvas.getContext('webgl');
+  apiEl.textContent = 'WebGL';
+  if (!gl) {
+    scoreEl.textContent = '—';
+    metaEl.textContent = 'WebGPU/WebGL 不可用';
+    state.results.gpu = null;
+    return;
+  }
+  const vs = `attribute vec2 p;void main(){gl_Position=vec4(p,0.0,1.0);}`;
+  const fs = `precision highp float;uniform float T;void main(){vec2 uv=gl_FragCoord.xy/512.0;float x=uv.x+T;float y=uv.y;float s=0.0;for(int i=0;i<2000;i++){x = x*1.000001+0.999999;y = y*0.999997+1.000003;s+=x+y;}gl_FragColor=vec4(fract(s),uv,1.0);}`;
+  function compile(type, src){
+    const sh = gl.createShader(type); gl.shaderSource(sh, src); gl.compileShader(sh);
+    if(!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+    return sh;
+  }
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(prog);
+  if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+  const tLoc = gl.getUniformLocation(prog, "T");
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, "p");
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  const totalTargetMs = totalMs;
+  const records = [];
+  let firstStart = null;
+  const pixels = canvas.width * canvas.height;
+  const workPerFrame = pixels * 2000;
+  const nextFrame = () => new Promise(requestAnimationFrame);
+  while (true) {
+    await nextFrame();
+    const start = performance.now();
+    gl.uniform1f(tLoc, records.length / 60);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.finish();
+    const end = performance.now();
+    records.push({ start, end, value: workPerFrame });
+    if (firstStart === null || start < firstStart) firstStart = start;
+    if (firstStart !== null && (end - firstStart) >= totalTargetMs) break;
+  }
+  const stats = computeWindow(records, windowMs);
+  const effectiveWindowMs = stats.windowDuration > 0 ? stats.windowDuration : stats.totalDuration;
+  const score = effectiveWindowMs > 0 ? stats.windowValue / effectiveWindowMs : 0;
+  state.results.gpu = {
+    api: 'WebGL',
+    score,
+    pixels,
+    frames: records.length,
+    itersPerFrag: 2000,
+    totalWork: stats.totalValue,
+    totalMs: stats.totalDuration,
+    windowWork: stats.windowValue,
+    windowMs: effectiveWindowMs,
+  };
+  scoreEl.textContent = fmt(score) + ' work/ms';
+  metaEl.textContent = `frames:${records.length} · 总时长:${(stats.totalDuration/1000).toFixed(1)} s · 后 ${(effectiveWindowMs/1000).toFixed(1)} s 工作量:${fmt(stats.windowValue,0)}`;
+}
+
+async function compileShaderModule(device, code) {
+  const module = device.createShaderModule({ code });
+  const info = await module.getCompilationInfo();
+  if (info.messages.length) {
+    console.group('[WGSL compile log]');
+    for (const m of info.messages) {
+      const fn = m.type === 'error' ? console.error : console.warn;
+      fn(`${m.type} @ ${m.lineNum}:${m.linePos} – ${m.message}`);
+    }
+    console.groupEnd();
+  }
+  const hasError = info.messages.some(m => m.type === 'error');
+  return { module, hasError };
+}
+
 async function runGpu(totalMs = 15_000, windowMs = 10_000) {
   const apiEl = document.getElementById('gpu-api');
   const scoreEl = document.getElementById('gpu-score');
   const metaEl = document.getElementById('gpu-meta');
   apiEl.textContent = state.env.gpuApi || 'Unknown';
 
-  if (state.env.gpuApi === 'WebGPU' && navigator.gpu) {
+  const runFallback = () => runGpuWebGLFallback(totalMs, windowMs, apiEl, scoreEl, metaEl);
+
+  if (!navigator.gpu) {
+    await runFallback();
+    return;
+  }
+
+  try {
     // WebGPU compute test: FMA-heavy loop
     const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) throw new Error('WebGPU adapter unavailable');
     const device = await adapter.requestDevice();
-    const workgroupSize = 256;
-    const groups = 2048; // 524,288 invocations
+    console.log('[WebGPU limits]', device.limits);
+    const lim = device.limits;
+    const workgroupSize = Math.max(1, Math.min(
+      256,
+      lim.maxComputeWorkgroupSizeX ?? 256,
+      lim.maxComputeInvocationsPerWorkgroup ?? 256
+    ));
+    const groups = 2048;
     const invocations = workgroupSize * groups;
 
-    const shader = /* wgsl */`
+    let shader = /* wgsl */`
       struct OutputBuf {
         values: array<f32>;
       };
@@ -346,10 +441,36 @@ async function runGpu(totalMs = 15_000, windowMs = 10_000) {
         outBuf.values[gid.x] = y;
       }`;
 
-    const pipeline = await device.createComputePipelineAsync({
-      layout: 'auto',
-      compute: { module: device.createShaderModule({ code: shader }), entryPoint: 'main' }
-    });
+    let { module, hasError } = await compileShaderModule(device, shader);
+    if (hasError) {
+      console.warn('FMA shader failed to compile, trying fallback without fma()');
+      shader = /* wgsl */`
+        struct OutputBuf {
+          values: array<f32>;
+        };
+
+        struct Params {
+          iters: u32;
+        };
+
+        @group(0) @binding(0) var<storage, read_write> outBuf: OutputBuf;
+        @group(0) @binding(1) var<uniform> params: Params;
+
+        @compute @workgroup_size(${workgroupSize})
+        fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+          var x = f32(gid.x) * 1e-6 + 1.0;
+          var y = 0.0;
+          for (var i: u32 = 0u; i < params.iters; i = i + 1u) {
+            x = (x * 1.000001) + 0.999999;
+            x = (x * 0.999997) + 1.000003;
+            y = y + x;
+            y = (y * 1.0000001) + 0.0000001;
+          }
+          outBuf.values[gid.x] = y;
+        }`;
+      ({ module, hasError } = await compileShaderModule(device, shader));
+      if (hasError) throw new Error('Fallback shader compilation failed');
+    }
 
     const outBuf = device.createBuffer({
       size: invocations * 4,
@@ -358,6 +479,19 @@ async function runGpu(totalMs = 15_000, windowMs = 10_000) {
     const paramBuf = device.createBuffer({
       size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
+
+    device.pushErrorScope('validation');
+    let pipelineError = null;
+    const pipeline = await device.createComputePipelineAsync({
+      layout: 'auto',
+      compute: { module, entryPoint: 'main' }
+    }).catch(err => {
+      pipelineError = err;
+      return null;
+    });
+    const pipeErr = await device.popErrorScope();
+    if (pipeErr) throw pipeErr;
+    if (pipelineError) throw pipelineError;
 
     async function runWithIters(iters) {
       device.queue.writeBuffer(paramBuf, 0, new Uint32Array([iters]));
@@ -415,70 +549,17 @@ async function runGpu(totalMs = 15_000, windowMs = 10_000) {
       windowWork: stats.windowValue,
       windowMs: effectiveWindowMs,
     };
+    apiEl.textContent = 'WebGPU';
     scoreEl.textContent = fmt(score) + ' iter/ms';
     metaEl.textContent = `dispatches: ${records.length} · 每次iters: ${fmt(chunkIters,0)} · 总时长: ${(stats.totalDuration/1000).toFixed(1)} s · 后 ${(effectiveWindowMs/1000).toFixed(1)} s 工作量: ${fmt(stats.windowValue,0)}`;
-  } else {
-    // WebGL fallback: heavy fragment loop
-    const canvas = document.getElementById('glcanvas');
-    const gl = canvas.getContext('webgl');
-    if (!gl) {
-      scoreEl.textContent = '—';
-      metaEl.textContent = 'WebGPU/WebGL 不可用';
-      return;
+  } catch (e) {
+    console.warn('WebGPU failed, fallback to WebGL:', e);
+    try {
+      await runFallback();
+    } catch (fallbackErr) {
+      console.error('WebGL fallback also failed:', fallbackErr);
+      throw fallbackErr;
     }
-    const vs = `attribute vec2 p;void main(){gl_Position=vec4(p,0.0,1.0);}`;
-    const fs = `precision highp float;uniform float T;void main(){vec2 uv=gl_FragCoord.xy/512.0;float x=uv.x+T;float y=uv.y;float s=0.0;for(int i=0;i<2000;i++){x = x*1.000001+0.999999;y = y*0.999997+1.000003;s+=x+y;}gl_FragColor=vec4(fract(s),uv,1.0);}`;
-    function compile(type, src){
-      const sh = gl.createShader(type); gl.shaderSource(sh, src); gl.compileShader(sh);
-      if(!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
-      return sh;
-    }
-    const prog = gl.createProgram();
-    gl.attachShader(prog, compile(gl.VERTEX_SHADER, vs));
-    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fs));
-    gl.linkProgram(prog);
-    if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
-    gl.useProgram(prog);
-    const tLoc = gl.getUniformLocation(prog, "T");
-    const buf = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
-    const loc = gl.getAttribLocation(prog, "p");
-    gl.enableVertexAttribArray(loc);
-    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-    const totalTargetMs = totalMs;
-    const records = [];
-    let firstStart = null;
-    const pixels = canvas.width * canvas.height;
-    const workPerFrame = pixels * 2000;
-    const nextFrame = () => new Promise(requestAnimationFrame);
-    while (true) {
-      await nextFrame();
-      const start = performance.now();
-      gl.uniform1f(tLoc, records.length / 60);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-      gl.finish();
-      const end = performance.now();
-      records.push({ start, end, value: workPerFrame });
-      if (firstStart === null || start < firstStart) firstStart = start;
-      if (firstStart !== null && (end - firstStart) >= totalTargetMs) break;
-    }
-    const stats = computeWindow(records, windowMs);
-    const effectiveWindowMs = stats.windowDuration > 0 ? stats.windowDuration : stats.totalDuration;
-    const score = effectiveWindowMs > 0 ? stats.windowValue / effectiveWindowMs : 0;
-    state.results.gpu = {
-      api: 'WebGL',
-      score,
-      pixels,
-      frames: records.length,
-      itersPerFrag: 2000,
-      totalWork: stats.totalValue,
-      totalMs: stats.totalDuration,
-      windowWork: stats.windowValue,
-      windowMs: effectiveWindowMs,
-    };
-    scoreEl.textContent = fmt(score) + ' work/ms';
-    metaEl.textContent = `frames:${records.length} · 总时长:${(stats.totalDuration/1000).toFixed(1)} s · 后 ${(effectiveWindowMs/1000).toFixed(1)} s 工作量:${fmt(stats.windowValue,0)}`;
   }
 }
 
@@ -503,7 +584,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   await detectEnv();
   document.getElementById('btn-cpu-single').onclick = () => runCpuSingle().catch(err => alert(err.message));
   document.getElementById('btn-cpu-multi').onclick = () => runCpuMulti().catch(err => alert(err.message));
-  document.getElementById('btn-gpu').onclick = () => runGpu().catch(err => alert(err.message));
+  document.getElementById('btn-gpu').onclick = () => runGpu();
   document.getElementById('btn-run-all').onclick = async () => {
     try {
       await runCpuSingle();
