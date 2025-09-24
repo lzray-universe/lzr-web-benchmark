@@ -342,9 +342,9 @@ async function runGpuWebGLFallback(totalMs, windowMs, apiEl, scoreEl, metaEl) {
   let firstStart = null;
   const pixels = canvas.width * canvas.height;
   const workPerFrame = pixels * 2000;
-  const nextFrame = () => new Promise(requestAnimationFrame);
+  //const nextFrame = () => new Promise(requestAnimationFrame);
   while (true) {
-    await nextFrame();
+    //await nextFrame();
     const start = performance.now();
     gl.uniform1f(tLoc, records.length / 60);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
