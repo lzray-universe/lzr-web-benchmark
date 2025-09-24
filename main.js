@@ -167,7 +167,7 @@ function fmt(n, digits=1) {
   return n.toFixed(digits);
 }
 
-async function runCpuSingle(targetMs = 1500) {
+async function runCpuSingle(targetMs = 10_000) {
   const {$} = window;
   const meta = document.getElementById('cpu-single-meta');
   meta.textContent = '准备中…';
@@ -192,7 +192,7 @@ async function runCpuSingle(targetMs = 1500) {
   meta.textContent = `迭代: ${fmt(iterations, 0)} · 用时: ${dt.toFixed(1)} ms · 校准: ${sampleMs.toFixed(1)} ms`;
 }
 
-async function runCpuMulti(targetMs = 2000) {
+async function runCpuMulti(targetMs = 10_000) {
   const meta = document.getElementById('cpu-multi-meta');
   meta.textContent = '准备中…';
   const { itersPerMs } = await cpuCalibrate();
@@ -219,7 +219,7 @@ async function runCpuMulti(targetMs = 2000) {
 }
 
 // ---------- GPU Benchmark ----------
-async function runGpu(targetMs = 2000) {
+async function runGpu(targetMs = 10_000) {
   const apiEl = document.getElementById('gpu-api');
   const scoreEl = document.getElementById('gpu-score');
   const metaEl = document.getElementById('gpu-meta');
@@ -328,14 +328,17 @@ async function runGpu(targetMs = 2000) {
     const loc = gl.getAttribLocation(prog, "p");
     gl.enableVertexAttribArray(loc);
     gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-    const frames = 60;
     const t0 = performance.now();
-    for (let i=0;i<frames;i++){
-      gl.uniform1f(tLoc, i/60);
+    let frames = 0;
+    let t1 = t0;
+    while (true) {
+      gl.uniform1f(tLoc, frames / 60);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
       gl.finish();
+      frames++;
+      t1 = performance.now();
+      if (t1 - t0 >= targetMs) break;
     }
-    const t1 = performance.now();
     const dt = t1 - t0;
     const pixels = canvas.width * canvas.height;
     const work = pixels * 2000 * frames;
