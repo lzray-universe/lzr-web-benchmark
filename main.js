@@ -412,7 +412,8 @@ async function runGpu(totalMs = 15_000, windowMs = 10_000) {
       lim.maxComputeWorkgroupSizeX ?? 256,
       lim.maxComputeInvocationsPerWorkgroup ?? 256
     ));
-    const groups = 2048;
+    const maxGroups = Math.max(1, Math.min(8192, lim.maxComputeWorkgroupsPerDimension ?? 65535));
+    const groups = maxGroups;
     const invocations = workgroupSize * groups;
 
     let shader = /* wgsl */`
