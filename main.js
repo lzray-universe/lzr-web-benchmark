@@ -321,8 +321,15 @@ async function runGpu(totalMs = 15_000, windowMs = 10_000) {
     const invocations = workgroupSize * groups;
 
     const shader = /* wgsl */`
-      struct Params { iters: u32; };
-      @group(0) @binding(0) var<storage, read_write> outBuf: array<f32>;
+      struct OutputBuf {
+        values: array<f32>;
+      };
+
+      struct Params {
+        iters: u32;
+      };
+
+      @group(0) @binding(0) var<storage, read_write> outBuf: OutputBuf;
       @group(0) @binding(1) var<uniform> params: Params;
 
       @compute @workgroup_size(${workgroupSize})
@@ -336,7 +343,7 @@ async function runGpu(totalMs = 15_000, windowMs = 10_000) {
           y = y + x;
           y = fma(y, 1.0000001, 0.0000001);
         }
-        outBuf[gid.x] = y;
+        outBuf.values[gid.x] = y;
       }`;
 
     const pipeline = await device.createComputePipelineAsync({
@@ -349,7 +356,7 @@ async function runGpu(totalMs = 15_000, windowMs = 10_000) {
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
     });
     const paramBuf = device.createBuffer({
-      size: 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+      size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
 
     async function runWithIters(iters) {
