@@ -167,59 +167,146 @@ function fmt(n, digits=1) {
   return n.toFixed(digits);
 }
 
-async function runCpuSingle(targetMs = 10_000) {
-  const {$} = window;
+function computeWindow(records, windowLengthMs) {
+  if (!records.length) {
+    return {
+      totalDuration: 0,
+      windowDuration: 0,
+      totalValue: 0,
+      windowValue: 0,
+      start: 0,
+      end: 0,
+    };
+  }
+  let minStart = records[0].start;
+  let maxEnd = records[0].end;
+  let totalValue = 0;
+  for (const rec of records) {
+    if (rec.start < minStart) minStart = rec.start;
+    if (rec.end > maxEnd) maxEnd = rec.end;
+    totalValue += rec.value;
+  }
+  const windowEnd = maxEnd;
+  const windowStart = Math.max(minStart, windowEnd - windowLengthMs);
+  let windowValue = 0;
+  for (const rec of records) {
+    const overlapStart = Math.max(rec.start, windowStart);
+    const overlapEnd = Math.min(rec.end, windowEnd);
+    if (overlapEnd > overlapStart) {
+      const recDuration = rec.end - rec.start;
+      if (recDuration > 0) {
+        const fraction = (overlapEnd - overlapStart) / recDuration;
+        windowValue += rec.value * fraction;
+      } else {
+        windowValue += rec.value;
+      }
+    }
+  }
+  const windowDuration = windowEnd - windowStart;
+  return {
+    totalDuration: maxEnd - minStart,
+    windowDuration,
+    totalValue,
+    windowValue,
+    start: minStart,
+    end: maxEnd,
+  };
+}
+
+async function runCpuSingle(totalMs = 15_000, windowMs = 10_000) {
   const meta = document.getElementById('cpu-single-meta');
   meta.textContent = '准备中…';
   const { itersPerMs, sampleMs } = await cpuCalibrate();
-  const iterations = Math.max(10_000, Math.floor(itersPerMs * targetMs));
-  const w = createWorker();
-  const t0 = performance.now();
-  w.postMessage({ type: 'run', iterations });
-  const msg = await new Promise(res => w.onmessage = e => res(e.data));
-  w.terminate();
-  const dt = msg.durationMs;
-  const score = iterations / dt; // iter/ms
+  const chunkTargetMs = 200;
+  const iterationsPerChunk = Math.max(50_000, Math.floor(itersPerMs * chunkTargetMs));
+  const worker = createWorker();
+  const records = [];
+  let firstStart = null;
+
+  async function runChunk() {
+    return new Promise(res => {
+      worker.onmessage = e => res(e.data);
+      worker.postMessage({ type: 'run', iterations: iterationsPerChunk });
+    });
+  }
+
+  while (true) {
+    const msg = await runChunk();
+    records.push({ start: msg.startTime, end: msg.endTime, value: msg.iterations });
+    if (firstStart === null || msg.startTime < firstStart) firstStart = msg.startTime;
+    if (firstStart !== null && (msg.endTime - firstStart) >= totalMs) break;
+  }
+  worker.terminate();
+  const stats = computeWindow(records, windowMs);
+  const effectiveWindowMs = stats.windowDuration > 0 ? stats.windowDuration : stats.totalDuration;
+  const score = effectiveWindowMs > 0 ? stats.windowValue / effectiveWindowMs : 0;
   state.results.cpuSingle = {
     score,
-    iterations,
-    ms: dt,
+    totalIterations: stats.totalValue,
+    totalMs: stats.totalDuration,
+    windowIterations: stats.windowValue,
+    windowMs: effectiveWindowMs,
     itersPerMsCalib: itersPerMs,
     calibMs: sampleMs,
     threads: 1,
   };
   document.getElementById('cpu-single-score').textContent = fmt(score) + ' ' + OPS_LABEL;
-  meta.textContent = `迭代: ${fmt(iterations, 0)} · 用时: ${dt.toFixed(1)} ms · 校准: ${sampleMs.toFixed(1)} ms`;
+  meta.textContent = `总迭代: ${fmt(stats.totalValue, 0)} · 总时长: ${(stats.totalDuration/1000).toFixed(1)} s · 后 ${(effectiveWindowMs/1000).toFixed(1)} s 迭代: ${fmt(stats.windowValue, 0)} · 校准: ${sampleMs.toFixed(1)} ms`;
 }
 
-async function runCpuMulti(targetMs = 10_000) {
+async function runCpuMulti(totalMs = 15_000, windowMs = 10_000) {
   const meta = document.getElementById('cpu-multi-meta');
   meta.textContent = '准备中…';
   const { itersPerMs } = await cpuCalibrate();
   const threads = Math.min((navigator.hardwareConcurrency || 4), 16);
-  const perWorker = Math.max(50_000, Math.floor(itersPerMs * targetMs / threads));
+  const chunkTargetMs = 200;
+  const perWorker = Math.max(50_000, Math.floor(itersPerMs * chunkTargetMs));
   const workers = Array.from({length: threads}, () => createWorker());
-  let done = 0;
-  let totalIters = 0;
-  let start = performance.now();
-  const promises = workers.map(w => new Promise(res => {
-    w.onmessage = (e) => { totalIters += e.data.iterations; done++; res(e.data); };
-    w.postMessage({ type: 'run', iterations: perWorker });
-  }));
-  const results = await Promise.all(promises);
-  const end = performance.now();
-  workers.forEach(w => w.terminate());
-  const wallMs = end - start;
-  const score = totalIters / wallMs;
+  const records = [];
+  const startWall = performance.now();
+  let running = threads;
+  let stopScheduling = false;
+
+  await new Promise(resolve => {
+    workers.forEach((worker) => {
+      const schedule = () => {
+        if (stopScheduling) return;
+        worker.postMessage({ type: 'run', iterations: perWorker });
+      };
+      worker.onmessage = (e) => {
+        const msg = e.data;
+        records.push({ start: msg.startTime, end: msg.endTime, value: msg.iterations });
+        if (!stopScheduling && (performance.now() - startWall) < totalMs) {
+          schedule();
+        } else {
+          stopScheduling = true;
+          worker.terminate();
+          running--;
+          if (running === 0) resolve();
+        }
+      };
+      schedule();
+    });
+  });
+
+  const stats = computeWindow(records, windowMs);
+  const effectiveWindowMs = stats.windowDuration > 0 ? stats.windowDuration : stats.totalDuration;
+  const score = effectiveWindowMs > 0 ? stats.windowValue / effectiveWindowMs : 0;
+  const totalIterations = stats.totalValue;
   state.results.cpuMulti = {
-    score, iterations: totalIters, ms: wallMs, threads
+    score,
+    threads,
+    totalIterations,
+    totalMs: stats.totalDuration,
+    windowIterations: stats.windowValue,
+    windowMs: effectiveWindowMs,
   };
   document.getElementById('cpu-multi-score').textContent = fmt(score) + ' ' + OPS_LABEL;
-  meta.textContent = `线程: ${threads} · 总迭代: ${fmt(totalIters,0)} · 墙钟时间: ${wallMs.toFixed(1)} ms`;
+  meta.textContent = `线程: ${threads} · 总迭代: ${fmt(totalIterations,0)} · 总时长: ${(stats.totalDuration/1000).toFixed(1)} s · 后 ${(effectiveWindowMs/1000).toFixed(1)} s 迭代: ${fmt(stats.windowValue,0)}`;
 }
 
 // ---------- GPU Benchmark ----------
-async function runGpu(targetMs = 10_000) {
+async function runGpu(totalMs = 15_000, windowMs = 10_000) {
   const apiEl = document.getElementById('gpu-api');
   const scoreEl = document.getElementById('gpu-score');
   const metaEl = document.getElementById('gpu-meta');
@@ -284,21 +371,45 @@ async function runGpu(targetMs = 10_000) {
       device.queue.submit([encoder.finish()]);
       await device.queue.onSubmittedWorkDone();
       const t1 = performance.now();
-      return t1 - t0;
+      return { duration: t1 - t0, start: t0, end: t1 };
     }
 
     // Calibrate
     let iters = 500;
-    let dt = await runWithIters(iters);
+    let warmup = await runWithIters(iters);
+    let dt = warmup.duration;
     if (dt < 1) dt = 1;
-    const scale = targetMs / dt;
-    iters = Math.max(200, Math.floor(iters * scale));
-    dt = await runWithIters(iters);
+    const chunkTargetMs = 200;
+    const scale = chunkTargetMs / dt;
+    let chunkIters = Math.max(200, Math.floor(iters * scale));
+    // One more warmup with adjusted iterations (not recorded)
+    warmup = await runWithIters(chunkIters);
 
-    const score = (invocations * iters) / dt; // invocations*iters per ms
-    state.results.gpu = { api: 'WebGPU', score, invocations, iters, ms: dt };
+    const records = [];
+    let firstStart = null;
+    while (true) {
+      const res = await runWithIters(chunkIters);
+      records.push({ start: res.start, end: res.end, value: invocations * chunkIters });
+      if (firstStart === null || res.start < firstStart) firstStart = res.start;
+      if (firstStart !== null && (res.end - firstStart) >= totalMs) break;
+    }
+
+    const stats = computeWindow(records, windowMs);
+    const effectiveWindowMs = stats.windowDuration > 0 ? stats.windowDuration : stats.totalDuration;
+    const score = effectiveWindowMs > 0 ? stats.windowValue / effectiveWindowMs : 0;
+    state.results.gpu = {
+      api: 'WebGPU',
+      score,
+      invocations,
+      iterationsPerDispatch: chunkIters,
+      dispatches: records.length,
+      totalWork: stats.totalValue,
+      totalMs: stats.totalDuration,
+      windowWork: stats.windowValue,
+      windowMs: effectiveWindowMs,
+    };
     scoreEl.textContent = fmt(score) + ' iter/ms';
-    metaEl.textContent = `invocations: ${fmt(invocations)} · iters: ${fmt(iters)} · time: ${dt.toFixed(1)} ms`;
+    metaEl.textContent = `dispatches: ${records.length} · 每次iters: ${fmt(chunkIters,0)} · 总时长: ${(stats.totalDuration/1000).toFixed(1)} s · 后 ${(effectiveWindowMs/1000).toFixed(1)} s 工作量: ${fmt(stats.windowValue,0)}`;
   } else {
     // WebGL fallback: heavy fragment loop
     const canvas = document.getElementById('glcanvas');
@@ -328,24 +439,37 @@ async function runGpu(targetMs = 10_000) {
     const loc = gl.getAttribLocation(prog, "p");
     gl.enableVertexAttribArray(loc);
     gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-    const t0 = performance.now();
-    let frames = 0;
-    let t1 = t0;
+    const totalTargetMs = totalMs;
+    const records = [];
+    let firstStart = null;
+    const pixels = canvas.width * canvas.height;
+    const workPerFrame = pixels * 2000;
     while (true) {
-      gl.uniform1f(tLoc, frames / 60);
+      const start = performance.now();
+      gl.uniform1f(tLoc, records.length / 60);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
       gl.finish();
-      frames++;
-      t1 = performance.now();
-      if (t1 - t0 >= targetMs) break;
+      const end = performance.now();
+      records.push({ start, end, value: workPerFrame });
+      if (firstStart === null || start < firstStart) firstStart = start;
+      if (firstStart !== null && (end - firstStart) >= totalTargetMs) break;
     }
-    const dt = t1 - t0;
-    const pixels = canvas.width * canvas.height;
-    const work = pixels * 2000 * frames;
-    const score = work / dt; // relative
-    state.results.gpu = { api: 'WebGL', score, pixels, frames, itersPerFrag: 2000, ms: dt };
+    const stats = computeWindow(records, windowMs);
+    const effectiveWindowMs = stats.windowDuration > 0 ? stats.windowDuration : stats.totalDuration;
+    const score = effectiveWindowMs > 0 ? stats.windowValue / effectiveWindowMs : 0;
+    state.results.gpu = {
+      api: 'WebGL',
+      score,
+      pixels,
+      frames: records.length,
+      itersPerFrag: 2000,
+      totalWork: stats.totalValue,
+      totalMs: stats.totalDuration,
+      windowWork: stats.windowValue,
+      windowMs: effectiveWindowMs,
+    };
     scoreEl.textContent = fmt(score) + ' work/ms';
-    metaEl.textContent = `pixels:${pixels} · iters/frag:2000 · frames:${frames} · time:${dt.toFixed(1)} ms`;
+    metaEl.textContent = `frames:${records.length} · 总时长:${(stats.totalDuration/1000).toFixed(1)} s · 后 ${(effectiveWindowMs/1000).toFixed(1)} s 工作量:${fmt(stats.windowValue,0)}`;
   }
 }
 
