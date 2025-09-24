@@ -6,7 +6,13 @@ self.onmessage = (e) => {
   const res = cpuKernel(iterations >>> 0);
   const t1 = performance.now();
   // Post minimal info to avoid overhead
-  self.postMessage({ iterations, durationMs: t1 - t0, checksum: res >>> 0 });
+  self.postMessage({
+    iterations,
+    durationMs: t1 - t0,
+    startTime: t0,
+    endTime: t1,
+    checksum: res >>> 0,
+  });
 };
 
 // A mixed integer bitwise kernel with good JIT stability
