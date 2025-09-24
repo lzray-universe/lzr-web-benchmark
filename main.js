@@ -444,7 +444,9 @@ async function runGpu(totalMs = 15_000, windowMs = 10_000) {
     let firstStart = null;
     const pixels = canvas.width * canvas.height;
     const workPerFrame = pixels * 2000;
+    const nextFrame = () => new Promise(requestAnimationFrame);
     while (true) {
+      await nextFrame();
       const start = performance.now();
       gl.uniform1f(tLoc, records.length / 60);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
