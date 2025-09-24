@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LZR Web Benchmark</title>
+  <link rel="preconnect" href="self">
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Noto Sans CJK, PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif; margin: 0; padding: 0; }
+    header { padding: 16px 24px; border-bottom: 1px solid rgba(127,127,127,.25); position: sticky; top: 0; backdrop-filter: blur(6px); }
+    h1 { margin: 0; font-size: 20px; }
+    main { max-width: 980px; margin: 0 auto; padding: 24px; }
+    section { margin: 24px 0; padding: 16px; border: 1px solid rgba(127,127,127,.25); border-radius: 14px; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .card { flex: 1 1 320px; border: 1px solid rgba(127,127,127,.25); border-radius: 12px; padding: 12px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px dashed rgba(127,127,127,.2); }
+    .btn { appearance: none; border: 1px solid rgba(127,127,127,.3); background: transparent; padding: 8px 12px; border-radius: 10px; cursor: pointer; }
+    .btn.primary { background: #4f46e5; color: white; border-color: #4f46e5; }
+    .btn:disabled { opacity: .6; cursor: not-allowed; }
+    .muted { opacity: .7; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .score { font-size: 22px; font-weight: 700; }
+    .small { font-size: 12px; }
+    .caps { letter-spacing: .06em; text-transform: uppercase; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+    footer { padding: 24px; opacity: .7; text-align: center; }
+    .kbd { border: 1px solid rgba(127,127,127,.4); padding: 0 6px; border-radius: 6px; font-family: ui-monospace, Monaco, monospace; }
+    .tag { display: inline-block; padding: 2px 8px; border-radius: 999px; border: 1px solid rgba(127,127,127,.4); font-size: 12px; margin-right: 8px; }
+    .ok { color: #16a34a; }
+    .warn { color: #d97706; }
+    .err { color: #dc2626; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>LZR Web Benchmark</h1>
+  </header>
+  <main>
+    <section>
+      <div class="row" style="align-items:center; justify-content:space-between;">
+        <div>
+          <div class="muted">自动识别环境 &nbsp;·&nbsp; CPU 单核/多核 &nbsp;·&nbsp; GPU(WebGPU/WebGL)</div>
+          <div class="small muted">只在浏览器本地运行，不上传任何数据。</div>
+        </div>
+        <div class="row">
+          <button id="btn-run-all" class="btn primary">一键跑分</button>
+          <button id="btn-export" class="btn">导出 JSON</button>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h3>环境信息</h3>
+      <div id="env-tags" class="row"></div>
+      <div class="grid">
+        <div class="card"><b>设备</b><div id="device" class="mono"></div></div>
+        <div class="card"><b>操作系统</b><div id="platform" class="mono"></div></div>
+        <div class="card"><b>浏览器</b><div id="browser" class="mono"></div></div>
+        <div class="card"><b>CPU</b><div id="cpu" class="mono"></div></div>
+        <div class="card"><b>GPU</b><div id="gpu" class="mono"></div></div>
+        <div class="card"><b>内存</b><div id="memory" class="mono"></div></div>
+      </div>
+    </section>
+
+    <section id="cpu-section">
+      <div class="row" style="justify-content:space-between; align-items:center;">
+        <h3>CPU 跑分</h3>
+        <div class="row">
+          <button id="btn-cpu-single" class="btn">单核</button>
+          <button id="btn-cpu-multi" class="btn">多核</button>
+        </div>
+      </div>
+      <div class="grid">
+        <div class="card">
+          <div class="caps small muted">Single‑Core</div>
+          <div class="score" id="cpu-single-score">—</div>
+          <div class="small muted mono" id="cpu-single-meta">—</div>
+        </div>
+        <div class="card">
+          <div class="caps small muted">Multi‑Core</div>
+          <div class="score" id="cpu-multi-score">—</div>
+          <div class="small muted mono" id="cpu-multi-meta">—</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="gpu-section">
+      <div class="row" style="justify-content:space-between; align-items:center;">
+        <h3>GPU 跑分</h3>
+        <div class="row">
+          <button id="btn-gpu" class="btn">开始</button>
+        </div>
+      </div>
+      <div class="grid">
+        <div class="card">
+          <div class="caps small muted">API</div>
+          <div id="gpu-api" class="mono">—</div>
+        </div>
+        <div class="card">
+          <div class="caps small muted">Score</div>
+          <div class="score" id="gpu-score">—</div>
+          <div class="small muted mono" id="gpu-meta">—</div>
+        </div>
+      </div>
+      <canvas id="glcanvas" width="512" height="512" style="display:none;"></canvas>
+    </section>
+
+    <section>
+      <details>
+        <summary>说明 / Disclaimers</summary>
+        <ul>
+          <li>本页仅用于相对跑分（相同浏览器设置下比较不同设备）。由于浏览器沙箱、节能策略等影响，分数不具备绝对标准化意义。</li>
+          <li>多核测试通过 Web Workers 并行，可能受 <span class="mono">hardwareConcurrency</span> 与系统调度影响。</li>
+          <li>GPU 优先使用 WebGPU，若不可用则退回 WebGL。WebGPU 提供更稳定的计算测试。</li>
+          <li>不采集/上传任何个人信息，所有数据停留在您的浏览器中。</li>
+        </ul>
+      </details>
+    </section>
+
+    <footer>© 2025 LZR · MIT License</footer>
+  </main>
+
+<script src="./main.js"></script>
+</body>
+</html>
